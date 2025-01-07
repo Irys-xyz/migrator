@@ -8,7 +8,7 @@ import { resolve, dirname } from "path";
 import { Pool } from "undici";
 export const cli = new Command();
 
-const testnetBundlerUrl = "https://testnet-upload.irys.xyz";
+const testnetBundlerUrl = "https://uploader.irys.xyz";
 const arweaveBundlerUrl = "https://node1.irys.xyz";
 cli
   .option(
@@ -42,23 +42,27 @@ cli.command("migrate").action(async () => {
   const checkpoint = await getProgress(addresses, tags);
   if (checkpoint)
     console.debug(`resuming from checkpoint cursor ${checkpoint}`);
-  const q2 = query
+  let q = query
     .fields({
       id: true,
       token: true,
+      timestamp: true
     })
     .pageSize(+(options.checkpointSize ?? 200))
     .limit(Infinity)
-    .from(addresses)
-    .tags(tags)
-    .sort("DESC")
-    .after(checkpoint);
+    .sort("ASC")
+    .after(checkpoint)
 
-  let page = await q2.getPage();
+    if(tags.length) q = q.tags(tags)
+    if(addresses.length) q = q.from(addresses)
+
+  let page = await q.getPage();
   const node1Pool = ConnectionPool(arweaveBundlerUrl);
   const testnetUploadPool = ConnectionPool(testnetBundlerUrl);
   while (page?.length) {
-    const pagePromise = q2.getPage();
+    console.log(`${page.at(0)?.id} ${new Date(page.at(0)?.timestamp!!)} -> ${page.at(-1)?.id} ${new Date(page.at(-1)?.timestamp!!)}`)
+    const after = query.queryVars.after;
+    const pagePromise = q.getPage();
     const page2 = page.filter(Boolean);
     const p = PromisePool.for(page2)
       .withConcurrency(+(options.concurrency ?? 20))
@@ -77,7 +81,7 @@ cli.command("migrate").action(async () => {
       errors.forEach((e) => console.error(e));
       throw new Error("Unexpected Errors while migrating - aborting");
     }
-    await saveProgress(addresses, tags, query.queryVars.after);
+    await saveProgress(addresses, tags, after);
     // defer await to give it more time to fetch the page
     page = await pagePromise;
   }
@@ -86,11 +90,9 @@ cli.command("migrate").action(async () => {
 
 export const ConnectionPool = (url: string): Pool =>
   new Pool(url, {
+    connectTimeout: 10_000,
     headersTimeout: 10_000,
     bodyTimeout: 20_000,
-    keepAliveTimeout: 10_000,
-    pipelining: 10,
-    maxRequestsPerClient: 1000,
   });
 
 const irysInstanceMap = new Map<string, NodeIrys>();
@@ -133,14 +135,14 @@ async function migrate({
 }
 
 async function saveProgress(
-  address: string,
+  addresses: string[],
   tags: { name: string; values: string[] }[],
   latestTxId: string,
 ) {
-  const name = getCheckpointName(address, tags);
+  const name = getCheckpointName(addresses, tags);
   const bn = dirname(name);
   await fsPromises.mkdir(bn, { recursive: true });
-  await fsPromises.writeFile(name, address + tags + "\n" + latestTxId);
+  await fsPromises.writeFile(name, JSON.stringify(addresses) + JSON.stringify(tags) + "\n" + latestTxId);
 }
 
 async function getProgress(
@@ -167,8 +169,8 @@ function getIrys(token: string) {
   return irys;
 }
 
-async function parseAddressesArg(addressArg) {
-  if (!addressArg || addressArg?.length == 0) return;
+async function parseAddressesArg(addressArg): Promise<string[]> {
+  if (!addressArg || addressArg?.length == 0) return [];
   const addresses = (await checkPath(addressArg))
     ? readFile(addressArg)
     : addressArg;
